@@ -208,3 +208,92 @@ log.Println("Downloads complete!")
 
 When downloading assets asynchronously, you should keep in mind the potentially large number of assets embedded
 into a typical web page. For that reason you should setup a queue that downloads only a few at a time.
+
+## Isolated tabs
+
+A common scraping pattern is logging in once and then handing the same
+filtered listing page to several independent collection branches. Surf
+supports this with `NewTabFromSnapshot()`, which opens an explicitly isolated
+browser tab from the current page.
+
+```go
+bow := surf.NewBrowser()
+
+// Log in once. Every tab below reuses this session through the shared
+// cookie jar.
+err := bow.PostForm("https://example.com/login", url.Values{
+    "user": {"alice"},
+    "pass": {"secret"},
+})
+if err != nil {
+    panic(err)
+}
+if err := bow.Open("https://example.com/filters"); err != nil {
+    panic(err)
+}
+
+// Two independent collectors working from the same listing page.
+branchA := bow.NewTabFromSnapshot()
+branchB := bow.NewTabFromSnapshot()
+defer branchA.Close()
+defer branchB.Close()
+```
+
+### What is shared, what is isolated
+
+The tab starts from a deep-copied snapshot of the current page. The following
+resources are **shared** on purpose:
+
+* The cookie jar, so the login session is visible in every tab.
+* The bookmarks jar.
+* The initial HTTP `Transport` (connection pooling keeps working).
+
+Everything that belongs to a single browsing context is **owned by the tab**:
+
+* The page DOM, raw body and form modifications - edits never reach the
+  parent or sibling tabs.
+* Request headers and their underlying slices (`AddRequestHeader`,
+  `DelRequestHeader` stay local).
+* Browser attributes and the redirect policy (`SetAttribute`, including
+  `FollowRedirects`).
+* Navigation history. `Back()` can only reach the tab's own snapshot and the
+  pages the tab itself visited; it can never walk into the parent's history.
+* Meta-refresh timers. Calling `Close()` stops only the closing tab's timer.
+* The `*http.Client`. The initial transport is shared, but calling
+  `SetTransport()` or `SetTimeout()` on a tab never mutates the parent
+  client.
+
+```go
+branchA.AddRequestHeader("X-Branch", "a")
+branchB.AddRequestHeader("X-Branch", "b")
+
+// Interleaved navigation is safe: each tab keeps its own DOM and history.
+_ = branchA.Open("https://example.com/page/1")
+_ = branchB.Open("https://example.com/page/2")
+branchA.Back() // returns to branchA's snapshot of /filters
+
+// Reconfiguring a tab's client cannot affect the parent browser.
+branchA.SetTimeout(5 * time.Second)
+branchA.SetTransport(http.DefaultTransport)
+
+// Closing a tab stops its refresh timer only. The shared transport is not
+// closed and the shared cookies are not cleared.
+branchA.Close()
+```
+
+A failed navigation leaves the tab on its snapshot and never pollutes another
+tab or the parent. Tabs can also be created before any page has been loaded;
+they simply start with a blank snapshot and can navigate immediately.
+
+```go
+blank := surf.NewBrowser()
+tab := blank.NewTabFromSnapshot()
+err := tab.Open("https://example.com/login") // works without a current page
+```
+
+### NewTab versus NewTabFromSnapshot
+
+The legacy `NewTab()` method is unchanged for backwards compatibility. It
+performs a shallow copy, so the clone keeps sharing the same state pointer,
+header map, attribute map, history and HTTP client with the parent. Use
+`NewTabFromSnapshot()` whenever the branches need to be isolated.

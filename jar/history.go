@@ -61,6 +61,12 @@ func (his *MemoryHistory) SetMax(max int) {
 	his.maxHist = max
 }
 
+// Max returns the max history length. A value of 0 means history trimming
+// is disabled and the list may grow infinitely.
+func (his *MemoryHistory) Max() int {
+	return his.maxHist
+}
+
 // Clear removes all history.
 func (his *MemoryHistory) Clear() {
 	his.list.Init()

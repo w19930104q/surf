@@ -36,6 +36,7 @@ func TestMemoryHistoryWithMax(t *testing.T) {
 	stack.SetMax(2)
 
 	ut.AssertEquals(2, stack.maxHist)
+	ut.AssertEquals(2, stack.Max())
 
 	page1 := &State{}
 	stack.Push(page1)

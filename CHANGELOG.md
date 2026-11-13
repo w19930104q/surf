@@ -1,3 +1,10 @@
+#### Unreleased
+* Added `Browser.NewTabFromSnapshot()` for explicitly isolated tabs: a deep-copied page snapshot with a shared cookie jar, but independent DOM, request headers (including backing slices), attributes/redirect policy, navigation history, refresh timers and HTTP client configuration. The initial transport remains shared; `SetTransport`/`SetTimeout` on a tab never affects the parent.
+* Added `Browser.Close()` which stops only the tab's own meta-refresh timer without closing the shared transport or clearing shared cookies.
+* Added `jar.MemoryHistory.Max()` to read back the configured history length limit (the `History` interface itself is unchanged).
+* Meta-refresh goroutines now stop when their tab is closed.
+* The legacy shallow-copy `NewTab()` behaviour is preserved.
+
 #### v1.0 - 2017/03/18
 * Officially tags v1.0.
 * Changes docs to show importing gopkg.in/headzoo/surf.v1.

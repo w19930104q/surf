@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -185,6 +186,17 @@ type Browsable interface {
 	// Create a new Browser instance and inherit the configuration
 	// Read more: https://github.com/headzoo/surf/issues/23
 	NewTab() (b *Browser)
+
+	// NewTabFromSnapshot creates a new isolated tab starting from a snapshot
+	// of the current page. The cookie jar stays shared, while the DOM,
+	// headers, attributes, redirect policy, history, refresh timers and HTTP
+	// client configuration are owned by the new tab. See the method
+	// documentation for the full isolation contract.
+	NewTabFromSnapshot() *Browser
+
+	// Close stops the tab's background refresh timers. Shared resources,
+	// namely the cookie jar and HTTP transport, are left untouched.
+	Close()
 }
 
 // Browser is the default Browser implementation.
@@ -212,6 +224,18 @@ type Browser struct {
 
 	// refresh is a timer used to meta refresh pages.
 	refresh *time.Timer
+
+	// closed is signalled by Close to stop background refresh goroutines.
+	// It is nil for tabs created through the legacy NewTab method.
+	closed chan struct{}
+
+	// closeOnce makes Close safe to call multiple times.
+	closeOnce sync.Once
+
+	// snapshotTab marks a tab created with NewTabFromSnapshot. Such a tab may
+	// Back all the way to the single snapshot state its history starts with,
+	// while regular browsers keep the historical "at least two entries" rule.
+	snapshotTab bool
 
 	// relativeUrl makes from <base> or page url
 	relativeUrl *url.URL
@@ -312,9 +336,12 @@ func (bow *Browser) PostMultipart(u string, fields url.Values, files FileSet) er
 // Back loads the previously requested page.
 //
 // Returns a boolean value indicating whether a previous page existed, and was
-// successfully loaded.
+// successfully loaded. Regular browsers require at least two recorded
+// states. An isolated tab created with NewTabFromSnapshot may also return to
+// its single starting snapshot, but can never reach pages the parent visited
+// before the tab was opened.
 func (bow *Browser) Back() bool {
-	if bow.history.Len() > 1 {
+	if bow.history.Len() > 1 || (bow.snapshotTab && bow.history.Len() > 0) {
 		bow.state = bow.history.Pop()
 		return true
 	}
@@ -637,9 +664,27 @@ func (bow *Browser) Find(expr string) *goquery.Selection {
 	return bow.state.Dom.Find(expr)
 }
 
+// NewTab creates a new Browser that shares the parent's jars, client and
+// current state through a shallow field copy. This legacy behaviour is kept
+// for backwards compatibility; for explicit per-tab isolation use
+// NewTabFromSnapshot instead.
 func (bow *Browser) NewTab() (b *Browser) {
-	b = &Browser{}
-	*b = *bow
+	// Explicit field-by-field shallow copy. The jars, client, state, headers
+	// map, attributes map, history and refresh timer stay shared, matching
+	// the historical NewTab behaviour. The close machinery is intentionally
+	// not copied, so closing one browser never signals the other.
+	b = &Browser{
+		client:      bow.client,
+		state:       bow.state,
+		userAgent:   bow.userAgent,
+		bookmarks:   bow.bookmarks,
+		history:     bow.history,
+		headers:     bow.headers,
+		attributes:  bow.attributes,
+		refresh:     bow.refresh,
+		relativeUrl: bow.relativeUrl,
+		body:        bow.body,
+	}
 
 	return b
 }
@@ -751,7 +796,13 @@ func (bow *Browser) httpRequest(req *http.Request) error {
 		return err
 	}
 
-	bow.history.Push(bow.state)
+	// Record the previous state before replacing it. When the current state
+	// is already on top of the history - as is the case for the snapshot an
+	// isolated tab starts from - it must not be pushed twice. A nil state
+	// means the browser was assembled manually without SetState.
+	if bow.state != nil && bow.history.Top() != bow.state {
+		bow.history.Push(bow.state)
+	}
 	bow.state = jar.NewHistoryState(req, resp, dom)
 	bow.postSend()
 
@@ -776,8 +827,12 @@ func (bow *Browser) postSend() {
 				if err == nil {
 					bow.refresh = time.NewTimer(dur)
 					go func() {
-						<-bow.refresh.C
-						bow.Reload()
+						select {
+						case <-bow.refresh.C:
+							bow.Reload()
+						case <-bow.done():
+							// The tab was closed before the timer fired.
+						}
 					}()
 				}
 			}

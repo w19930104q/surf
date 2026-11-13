@@ -323,6 +323,15 @@ func (bow *Browser) Body() string
 ```
 Body returns the page body as a string of html.
 
+#### func (*Browser) Close
+
+```go
+func (bow *Browser) Close()
+```
+Close stops the tab's own meta-refresh timers. The shared cookie jar and HTTP
+transport are left untouched, so other tabs keep their session and
+connections. Close is safe to call multiple times.
+
 #### func (*Browser) Bookmark
 
 ```go
@@ -390,6 +399,27 @@ Forms returns an array of every form in the page.
 func (bow *Browser) Head(u string) error
 ```
 Open requests the given URL using the HEAD method.
+
+#### func (*Browser) NewTab
+
+```go
+func (bow *Browser) NewTab() (b *Browser)
+```
+NewTab creates a new browser through a shallow copy of the parent. The clone
+shares the parent's state, jars, headers, attributes, history and HTTP
+client. For per-tab isolation use NewTabFromSnapshot instead.
+
+#### func (*Browser) NewTabFromSnapshot
+
+```go
+func (bow *Browser) NewTabFromSnapshot() *Browser
+```
+NewTabFromSnapshot creates an isolated tab starting from a deep-copied
+snapshot of the current page. The cookie jar, bookmarks jar and the initial
+HTTP transport are shared, while the DOM and body, request headers and their
+slices, attributes and redirect policy, navigation history, refresh timers
+and HTTP client configuration are owned by the new tab. It works even when no
+page has been loaded yet.
 
 #### func (*Browser) Images
 
