@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -213,11 +214,13 @@ type Browser struct {
 	// refresh is a timer used to meta refresh pages.
 	refresh *time.Timer
 
-	// relativeUrl makes from <base> or page url
-	relativeUrl *url.URL
-
-	// body of the current page.
-	body []byte
+	// refreshMu guards refresh and refreshGen. refreshGen is bumped every
+	// time the current page changes (new request, Back or Reload); a refresh
+	// goroutine only navigates when its generation is still current, which
+	// keeps a timer scheduled by an old page from re-navigating after the
+	// browser has moved on.
+	refreshMu  sync.Mutex
+	refreshGen uint64
 }
 
 // buildClient instanciates the *http.Client used by the browser
@@ -311,14 +314,29 @@ func (bow *Browser) PostMultipart(u string, fields url.Values, files FileSet) er
 
 // Back loads the previously requested page.
 //
+// Back restores the complete state of the previous page (URL, status code,
+// response headers, DOM, downloaded bytes and effective base URL) from the
+// history without issuing an HTTP request. Any meta refresh timer scheduled
+// by the current page is cancelled, so it cannot navigate after the move.
+//
 // Returns a boolean value indicating whether a previous page existed, and was
 // successfully loaded.
 func (bow *Browser) Back() bool {
-	if bow.history.Len() > 1 {
-		bow.state = bow.history.Pop()
-		return true
+	if bow.history.Len() == 0 {
+		return false
 	}
-	return false
+	prev := bow.history.Pop()
+	// Only fully loaded pages are pushed by the browser, but defend against
+	// hand-built history jars: never install a state that cannot be rendered.
+	if prev == nil || prev.Response == nil {
+		return false
+	}
+
+	// Cancel the refresh timer of the page we are leaving and invalidate any
+	// goroutine waiting on it.
+	bow.cancelRefresh()
+	bow.state = prev
+	return true
 }
 
 // Reload duplicates the last successful request.
@@ -577,18 +595,31 @@ func (bow *Browser) ResolveStringUrl(u string) (string, error) {
 	return pu.String(), nil
 }
 
-// RelativeUrl returns URL relative to which all the others work
+// RelativeUrl returns URL relative to which all the others work.
+//
+// The effective base URL is part of the loaded page state, so navigating
+// Back restores it. A page without a usable <base> tag resolves relative
+// links against its own URL rather than inheriting the base of a previously
+// visited page.
 func (bow *Browser) RelativeUrl() *url.URL {
-	if bow.relativeUrl == nil {
-		return bow.Url()
+	if bow.state != nil && bow.state.Base != nil {
+		return bow.state.Base
 	}
-
-	return bow.relativeUrl
+	return bow.Url()
 }
 
 // Download writes the contents of the document to the given writer.
+//
+// The bytes returned are the decoded response body captured when the current
+// page was loaded, so Download after Back serves the historical page rather
+// than any page visited since.
 func (bow *Browser) Download(o io.Writer) (int64, error) {
-	buff := bytes.NewBuffer(bow.body)
+	if bow.state == nil || bow.state.Body == nil {
+		return 0, errors.NewPageNotLoaded(
+			"The raw contents of this page are not available. States created with " +
+				"SetState do not store response bytes, so Download cannot serve them.")
+	}
+	buff := bytes.NewBuffer(bow.state.Body)
 	return io.Copy(o, buff)
 }
 
@@ -638,8 +669,19 @@ func (bow *Browser) Find(expr string) *goquery.Selection {
 }
 
 func (bow *Browser) NewTab() (b *Browser) {
-	b = &Browser{}
-	*b = *bow
+	// Copy the configuration and shared jars field by field. The mutex is
+	// deliberately not copied: the tab gets its own guard and starts without
+	// a pending refresh timer.
+	b = &Browser{
+		client:     bow.client,
+		state:      bow.state,
+		userAgent:  bow.userAgent,
+		bookmarks:  bow.bookmarks,
+		history:    bow.history,
+		headers:    bow.headers,
+		attributes: bow.attributes,
+		refresh:    nil,
+	}
 
 	return b
 }
@@ -715,6 +757,12 @@ func (bow *Browser) httpPOST(u *url.URL, ref *url.URL, contentType string, body 
 }
 
 // send uses the given *http.Request to make an HTTP request.
+//
+// On any network, decompression or read failure the current state, body and
+// history are left untouched: the browser keeps showing the previous page and
+// the failed request is not recorded. Only once the whole response has been
+// read and parsed is the previous page pushed onto the history and the new
+// page state installed atomically.
 func (bow *Browser) httpRequest(req *http.Request) error {
 	if bow.client == nil {
 		bow.client = bow.buildClient()
@@ -726,74 +774,142 @@ func (bow *Browser) httpRequest(req *http.Request) error {
 	}
 	defer resp.Body.Close()
 
-	var reader io.Reader
+	var reader io.ReadCloser
 	switch resp.Header.Get("Content-Encoding") {
 	case "gzip":
-		reader, err = gzip.NewReader(resp.Body)
-		if err != nil {
-			return err
+		gzReader, gzErr := gzip.NewReader(resp.Body)
+		if gzErr != nil {
+			return gzErr
 		}
+		reader = gzReader
 	case "deflate":
+		// flate.NewReader never returns nil; stream corruption is reported
+		// through Read and the Close checked below.
 		reader = flate.NewReader(resp.Body)
-
 	default:
-		reader = resp.Body
+		reader = &nopReadCloser{resp.Body}
 	}
 
-	bow.body, err = ioutil.ReadAll(reader)
+	body, err := ioutil.ReadAll(reader)
+	// Flate reports corrupt streams through the reader's Close, so check both
+	// Read and Close errors instead of silently swallowing bad compression.
+	if closeErr := reader.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
 	if err != nil {
 		return err
 	}
 
-	buff := bytes.NewBuffer(bow.body)
-	dom, err := goquery.NewDocumentFromReader(buff)
+	dom, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 
-	bow.history.Push(bow.state)
-	bow.state = jar.NewHistoryState(req, resp, dom)
+	base := bow.resolveBase(resp.Request.URL, dom)
+
+	// Everything above succeeded: only now mutate the browser state.
+	if bow.state != nil && bow.state.Response != nil {
+		bow.history.Push(bow.state)
+	}
+	bow.state = jar.NewPageState(req, resp, dom, body, base)
 	bow.postSend()
 
 	return nil
 }
 
+// nopReadCloser wraps an io.Reader with a no-op Close so every decoding
+// branch exposes the same io.ReadCloser interface.
+type nopReadCloser struct {
+	io.Reader
+}
+
+func (nopReadCloser) Close() error { return nil }
+
+// resolveBase determines the effective base URL of a freshly parsed page.
+//
+// Base resolution is performed for every page regardless of the
+// MetaRefreshHandling attribute: the two features are independent. When the
+// document has no usable <base href> the page URL is returned, which means a
+// page without a base never inherits the base of a previously visited page.
+func (bow *Browser) resolveBase(pageURL *url.URL, dom *goquery.Document) *url.URL {
+	base := pageURL
+	sel := dom.Find("base[href]").First()
+	if sel.Length() > 0 {
+		if href, ok := sel.Attr("href"); ok {
+			if baseURL, err := url.Parse(href); err == nil {
+				base = pageURL.ResolveReference(baseURL)
+			}
+		}
+	}
+	return base
+}
+
 // preSend sets browser state before sending a request.
+//
+// The refresh timer of the page being left is cancelled and its generation
+// invalidated, so its goroutine can never navigate away from the new page.
 func (bow *Browser) preSend() {
+	bow.cancelRefresh()
+}
+
+// cancelRefresh stops any pending meta refresh timer and bumps the refresh
+// generation, invalidating goroutines still waiting on an older timer.
+func (bow *Browser) cancelRefresh() {
+	bow.refreshMu.Lock()
+	defer bow.refreshMu.Unlock()
 	if bow.refresh != nil {
 		bow.refresh.Stop()
+		bow.refresh = nil
 	}
+	bow.refreshGen++
 }
 
 // postSend sets browser state after sending a request.
+//
+// The <base> tag is handled separately during state construction in
+// resolveBase, so it is independent of MetaRefreshHandling. Only the meta
+// refresh timer itself is gated by the attribute.
 func (bow *Browser) postSend() {
-	if isContentTypeHtml(bow.state.Response) && bow.attributes[MetaRefreshHandling] {
-		sel := bow.Find("meta[http-equiv='refresh']")
-		if sel.Length() > 0 {
-			attr, ok := sel.Attr("content")
-			if ok {
-				dur, err := time.ParseDuration(attr + "s")
-				if err == nil {
-					bow.refresh = time.NewTimer(dur)
-					go func() {
-						<-bow.refresh.C
-						bow.Reload()
-					}()
-				}
-			}
-		}
-
-		baseTag := bow.Find("base[href]")
-		if baseTag.Length() > 0 {
-			if href, exists := baseTag.Attr("href"); exists {
-				baseUrl, err := url.Parse(href)
-
-				if err == nil {
-					bow.relativeUrl = bow.ResolveUrl(baseUrl)
-				}
-			}
-		}
+	if !(isContentTypeHtml(bow.state.Response) && bow.attributes[MetaRefreshHandling]) {
+		return
 	}
+	sel := bow.Find("meta[http-equiv='refresh']")
+	if sel.Length() == 0 {
+		return
+	}
+	attr, ok := sel.Attr("content")
+	if !ok {
+		return
+	}
+
+	// Accept both the bare form ("5") and the URL form ("5; url=/next").
+	durPart := attr
+	if semi := strings.Index(attr, ";"); semi >= 0 {
+		durPart = strings.TrimSpace(attr[:semi])
+	}
+	dur, err := time.ParseDuration(durPart + "s")
+	if err != nil {
+		return
+	}
+
+	bow.refreshMu.Lock()
+	bow.refresh = time.NewTimer(dur)
+	timer := bow.refresh
+	gen := bow.refreshGen
+	bow.refreshMu.Unlock()
+
+	go func() {
+		<-timer.C
+		bow.refreshMu.Lock()
+		current := bow.refreshGen
+		bow.refreshMu.Unlock()
+		// Only the timer of the still-current page may navigate. After a
+		// Back or a jump to another page the generation has changed.
+		if current != gen {
+			return
+		}
+		bow.Reload()
+	}()
 }
 
 // shouldRedirect is used as the value to http.Client.CheckRedirect.

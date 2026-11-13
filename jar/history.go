@@ -3,23 +3,56 @@ package jar
 import (
 	"container/list"
 	"net/http"
+	"net/url"
 
 	"github.com/PuerkitoBio/goquery"
 )
 
 // State represents a point in time.
+//
+// A State is an immutable snapshot of a single loaded page: the request that
+// produced it, the response (URL, status code and headers), the parsed DOM,
+// the raw response bytes used by Browser.Download and the effective base URL
+// used to resolve relative links. All of these fields travel together through
+// the history so navigating Back restores the whole page without issuing a new
+// request.
 type State struct {
 	Request  *http.Request
 	Response *http.Response
 	Dom      *goquery.Document
+
+	// Body holds the decoded (post content-encoding) response bytes of the
+	// page. It may be nil for states created directly via SetState, in which
+	// case Browser.Download returns an explicit error.
+	Body []byte
+
+	// Base is the effective base URL of the page: the href of the first
+	// <base> tag when one resolves, otherwise the page URL itself.
+	Base *url.URL
 }
 
 // NewHistoryState creates and returns a new *State type.
+//
+// The signature is kept for backwards compatibility. States created this way
+// have no raw body bytes, so Browser.Download cannot serve their contents.
+// Prefer NewPageState for states produced by an actual page load.
 func NewHistoryState(req *http.Request, resp *http.Response, dom *goquery.Document) *State {
 	return &State{
 		Request:  req,
 		Response: resp,
 		Dom:      dom,
+	}
+}
+
+// NewPageState creates and returns a *State holding a complete page snapshot,
+// including the decoded response bytes and the effective base URL.
+func NewPageState(req *http.Request, resp *http.Response, dom *goquery.Document, body []byte, base *url.URL) *State {
+	return &State{
+		Request:  req,
+		Response: resp,
+		Dom:      dom,
+		Body:     body,
+		Base:     base,
 	}
 }
 
